@@ -59,7 +59,8 @@ brainstructure  = ft_getopt(varargin, 'brainstructure'); % the default is determ
 parcellation    = ft_getopt(varargin, 'parcellation');   % the default is determined further down
 precision       = ft_getopt(varargin, 'precision', 'single');
 writesurface    = ft_getopt(varargin, 'writesurface', true);
-debug            = ft_getopt(varargin, 'debug', false);
+debug           = ft_getopt(varargin, 'debug', false);
+skipnan         = ft_getopt(varargin, 'skipnan', false);
 
 if isfield(source, 'brainordinate')
   % this applies to a parcellated data representation
@@ -95,6 +96,8 @@ end
 dat    = source.(parameter);
 dimord = getdimord(source, parameter);
 
+skip = false; % HACK: prevent non-dense mappings from giving errors in the dense-specific code after the switch
+
 switch dimord
   case {'pos' 'pos_scalar'}
     % NIFTI_INTENT_CONNECTIVITY_DENSE_SCALARS
@@ -103,11 +106,13 @@ switch dimord
     intent_name = 'ConnDenseScalar';
     dat = transpose(dat);
     dimord = 'scalar_pos';
+    skip = all(isnan(dat),1);
   case 'pos_pos'
     % NIFTI_INTENT_CONNECTIVITY_DENSE
     extension = '.dconn.nii';
     intent_code = 3001;
     intent_name = 'ConnDense';
+    skip = all(isnan(dat),1);
   case 'pos_time'
     % NIFTI_INTENT_CONNECTIVITY_DENSE_SERIES
     extension = '.dtseries.nii';
@@ -115,6 +120,7 @@ switch dimord
     intent_name = 'ConnDenseSeries';
     dat = transpose(dat);
     dimord = 'time_pos';
+    skip = all(isnan(dat),1);
   case 'pos_freq'
     % NIFTI_INTENT_CONNECTIVITY_DENSE_SERIES
     extension = '.dtseries.nii';
@@ -122,7 +128,7 @@ switch dimord
     intent_name = 'ConnDenseSeries';
     dat = transpose(dat);
     dimord = 'freq_pos';
-    
+    skip = all(isnan(dat),1);
   case {'chan' 'chan_scalar'}
     % NIFTI_INTENT_CONNECTIVITY_PARCELLATED_SCALARS
     extension   = '.pscalar.nii';
@@ -161,10 +167,17 @@ switch dimord
     extension = '.dconnseries.nii'; % user's choise
     intent_code = 3000;
     intent_name = 'ConnUnknown';
+    skip = all(isnan(dat),1);
     
   otherwise
     error('unsupported dimord "%s"', dimord);
 end % switch
+
+if ~istrue(skipnan)
+  % do not skip any of the brainordinate positions 
+  skip(:) = false;
+end
+skip = skip(:); % should be column vector
 
 % determine each of the dimensions
 dimtok = tokenize(dimord, '_');
@@ -175,6 +188,7 @@ if isequal(x, '.nii')
 end
 
 [p, f, x] = fileparts(filename);
+%FIXME: isequal doesn't do separate comparisons on cells
 if any(isequal(x, {'.dtseries', '.ptseries', '.dconn', '.pconn', '.dscalar', '.pscalar'}))
   filename = fullfile(p, f); % strip the extension
 end
@@ -405,9 +419,14 @@ if any(strcmp(dimtok, 'pos'))
     end
     
     sel = (BrainStructure==i);
-    IndexCount = sum(sel);
-    IndexOffset = find(sel, 1, 'first') - 1; % zero offset
+    % TODO: check that sel doesn't have any holes in it, structures must be contiguous in matrix
+    NumVert = sum(sel); % take number of vertices from NaN-expanded matrix
+    ExpandedStructureStart = find(sel, 1, 'first');
     
+    sel = sel & ~skip; % drop the added NaNs
+    IndexCount = sum(sel); % these refer to indices in the data file, so we are relying on the data-writing part to use the same order
+    IndexOffset = find(sel(~skip), 1, 'first') - 1; % zero-indexed, excluding NaNs from indexing
+
     branch = find(tree, 'CIFTI/Matrix/MatrixIndicesMap');
     branch = branch(end);
     tree = add(tree, branch, 'element', 'BrainModel');
@@ -427,12 +446,12 @@ if any(strcmp(dimtok, 'pos'))
       tmp = round(tmp)' - 1; % transpose, zero offset
       tree = add(tree, branch, 'chardata', printwithspace(tmp));
     else
-      tmp = find(sel)-IndexOffset-1; % zero offset
+      tmp = find(sel) - ExpandedStructureStart; % zero-indexed, but we didn't subtract 1 from this variable
       tree = attributes(tree, 'add', branch, 'IndexOffset', printwithspace(IndexOffset));
       tree = attributes(tree, 'add', branch, 'IndexCount', printwithspace(IndexCount));
       tree = attributes(tree, 'add', branch, 'ModelType', 'CIFTI_MODEL_TYPE_SURFACE');
       tree = attributes(tree, 'add', branch, 'BrainStructure', BrainStructurelabel{i});
-      tree = attributes(tree, 'add', branch, 'SurfaceNumberOfVertices', printwithspace(IndexCount));
+      tree = attributes(tree, 'add', branch, 'SurfaceNumberOfVertices', printwithspace(NumVert));
       tree = add(tree, branch, 'element', 'VertexIndices');
       branch = find(tree, 'CIFTI/Matrix/MatrixIndicesMap/BrainModel/VertexIndices');
       branch = branch(end);
@@ -671,7 +690,7 @@ assert(hdr.dim(1)<8);
 for i=1:length(dimtok)
   switch dimtok{i}
     case 'pos'
-      hdr.dim(5+i) = size(source.pos,1);
+      hdr.dim(5+i) = sum(~skip);
     case 'chan'
       hdr.dim(5+i) = numel(source.label);
     case 'time'
@@ -723,6 +742,14 @@ fid = fopen(filename, 'wb');
 
 % write the header, this is 4+540 bytes
 write_nifti2_hdr(fid, hdr);
+
+if any(skip)
+  % skip the data for brainordinates where it is nan
+  if numel(dimtok)>0 && strcmp(dimtok{1}, 'pos'), dat = dat(~skip,:,:,:); end
+  if numel(dimtok)>1 && strcmp(dimtok{2}, 'pos'), dat = dat(:,~skip,:,:); end
+  if numel(dimtok)>2 && strcmp(dimtok{3}, 'pos'), dat = dat(:,:,~skip,:); end
+  if numel(dimtok)>3 && strcmp(dimtok{4}, 'pos'), dat = dat(:,:,:,~skip); end
+end
 
 if debug
   try
